@@ -1,0 +1,9 @@
+streamlit
+pandas
+Pillow
+geopy
+twilio
+folium
+streamlit-folium
+streamlit-js-eval
+openpyxl
