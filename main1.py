@@ -1,4 +1,20 @@
-# app.py (Enhanced Version with Dynamic Location Management)
+#!/usr/bin/env python3
+"""
+College Webcam Attendance System - Complete Updated Version
+Created: October 2025
+Version: 3.0 (Complete Update)
+Author: CS/IT Student Project
+
+Features:
+- Location-based attendance with GPS verification
+- Real-time webcam photo capture
+- Admin panel with zone management
+- Database with complete schema
+- Enhanced error handling and debugging
+- Dashboard with statistics and reports
+- Parent SMS notifications (optional)
+- Audit logging and backup system
+"""
 
 import streamlit as st
 import sqlite3
@@ -9,987 +25,1252 @@ from PIL import Image
 import os
 import hashlib
 import secrets
-from streamlit_js_eval import streamlit_js_eval
-from geopy.distance import geodesic
-from twilio.rest import Client
-import logging
-import folium
-from streamlit_folium import folium_static
 import json
+import time as time_module
+import logging
+from typing import Dict, Optional, Tuple, Any
 
-# --- Logging Configuration ---
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# Third-party imports
+try:
+    from streamlit_js_eval import streamlit_js_eval
+    from geopy.distance import geodesic
+    import folium
+    from streamlit_folium import folium_static
+except ImportError as e:
+    st.error(f"❌ Missing required package: {e}")
+    st.info("Run: pip install -r requirements.txt")
+    st.stop()
+
+# Optional imports (SMS functionality)
+try:
+    from twilio.rest import Client
+    TWILIO_AVAILABLE = True
+except ImportError:
+    TWILIO_AVAILABLE = False
+
+# --- Enhanced Logging Configuration ---
+log_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(funcName)s:%(lineno)d - %(message)s')
+
+# File handler
+file_handler = logging.FileHandler('attendance_app.log')
+file_handler.setFormatter(log_formatter)
+file_handler.setLevel(logging.DEBUG)
+
+# Console handler
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(log_formatter)
+console_handler.setLevel(logging.INFO)
+
+# Configure logger
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
+logger.addHandler(file_handler)
+logger.addHandler(console_handler)
 
 # --- Page Configuration ---
 st.set_page_config(
-    page_title="Attendance System", 
+    page_title="🎓 College Attendance System", 
     layout="wide", 
     initial_sidebar_state="expanded",
-    page_icon="🎓"
+    page_icon="🎓",
+    menu_items={
+        'Get Help': 'https://github.com/your-repo/attendance-system',
+        'Report a bug': 'https://github.com/your-repo/attendance-system/issues',
+        'About': "College Webcam Attendance System v3.0\nBuilt with Streamlit and SQLite"
+    }
 )
 
 # --- Constants & Configuration ---
-DEFAULT_COLLEGE_LOCATION = (10.678922, 77.032420)
-DEFAULT_ALLOWED_RADIUS_KM = 5.5
-MAX_IMAGE_SIZE_MB = 5
-ATTENDANCE_COOLDOWN_MINUTES = 60
+class Config:
+    """Application configuration"""
+    DEFAULT_COLLEGE_LOCATION = (10.678922, 77.032420)
+    DEFAULT_ALLOWED_RADIUS_KM = 5.5
+    MAX_IMAGE_SIZE_MB = 5
+    ATTENDANCE_COOLDOWN_MINUTES = 60
+    LOCATION_EXPIRE_MINUTES = 5
 
-# --- Twilio Setup ---
-ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID")
-AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN")
-FROM_SMS = os.environ.get("TWILIO_FROM_SMS")
+    # Database
+    DB_PATH = "attendance.db"
 
-if ACCOUNT_SID and AUTH_TOKEN and FROM_SMS:
-    client = Client(ACCOUNT_SID, AUTH_TOKEN)
-else:
-    client = None
+    # Time limits
+    DEFAULT_START_TIME = time(8, 0)   # 8:00 AM
+    DEFAULT_END_TIME = time(18, 0)    # 6:00 PM
+
+    # Security
+    ADMIN_PASSWORD_DEFAULT = "admin123"
+    SESSION_TIMEOUT_MINUTES = 30
 
 # --- Security Functions ---
-def hash_password(password):
-    """Hash password using SHA-256"""
-    return hashlib.sha256(password.encode()).hexdigest()
+class Security:
+    """Security utilities"""
 
-def verify_admin_password(password):
-    """Verify admin password (use environment variable in production)"""
-    stored_hash = os.environ.get("ADMIN_PASSWORD_HASH")
-    if not stored_hash:
-        stored_hash = hash_password("admin123")
-    return hash_password(password) == stored_hash
+    @staticmethod
+    def hash_password(password: str) -> str:
+        """Hash password using SHA-256"""
+        return hashlib.sha256(password.encode()).hexdigest()
 
-# --- Helper Functions ---
-def send_sms(to_number, message):
-    """Send SMS with error handling and logging"""
-    if not client:
-        logger.warning("Twilio not configured - SMS not sent")
-        return False
-    
-    try:
-        msg = client.messages.create(body=message, from_=FROM_SMS, to=to_number)
-        logger.info(f"SMS sent to {to_number} - SID: {msg.sid}")
+    @staticmethod
+    def verify_admin_password(password: str) -> bool:
+        """Verify admin password"""
+        stored_hash = os.environ.get("ADMIN_PASSWORD_HASH")
+        if not stored_hash:
+            stored_hash = Security.hash_password(Config.ADMIN_PASSWORD_DEFAULT)
+        return Security.hash_password(password) == stored_hash
+
+    @staticmethod
+    def sanitize_name(name: str) -> Optional[str]:
+        """Sanitize and validate student name"""
+        if not name:
+            return None
+
+        # Clean and normalize
+        name = ' '.join(name.strip().split())
+
+        if len(name) < 2 or len(name) > 100:
+            logger.warning(f"Invalid name length: {len(name)}")
+            return None
+
+        if not all(c.isalpha() or c.isspace() or c in "'-." for c in name):
+            logger.warning(f"Invalid characters in name: {name}")
+            return None
+
+        return name.lower()  # Store in lowercase for consistency
+
+# --- Database Management ---
+class DatabaseManager:
+    """Enhanced database operations"""
+
+    def __init__(self, db_path: str = Config.DB_PATH):
+        self.db_path = db_path
+        self.conn = None
+
+    @st.cache_resource
+    def get_connection(_self):
+        """Get cached database connection"""
+        try:
+            conn = sqlite3.connect(_self.db_path, check_same_thread=False)
+            conn.execute("PRAGMA foreign_keys = ON")
+            conn.execute("PRAGMA journal_mode = WAL")
+            logger.info("✅ Database connected successfully")
+            return conn
+        except Exception as e:
+            logger.error(f"Database connection error: {e}")
+            st.error(f"❌ Database connection failed: {e}")
+            return None
+
+    def ensure_tables_exist(self):
+        """Ensure all required tables exist"""
+        conn = self.get_connection()
+        if not conn:
+            return False
+
+        cursor = conn.cursor()
+
+        # Check if required tables exist
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        existing_tables = [row[0] for row in cursor.fetchall()]
+
+        required_tables = ['users', 'location_zones', 'attendance']
+        missing_tables = [t for t in required_tables if t not in existing_tables]
+
+        if missing_tables:
+            logger.warning(f"Missing tables: {missing_tables}")
+            st.warning(f"Missing database tables: {missing_tables}")
+            st.info("Please run: python db.py")
+            return False
+
         return True
-    except Exception as e:
-        logger.error(f"SMS failed to {to_number}: {str(e)}")
-        st.error(f"❌ SMS failed: {str(e)}")
+
+    def get_active_location_zone(self) -> Optional[Dict]:
+        """Get the currently active location zone"""
+        conn = self.get_connection()
+        if not conn:
+            return None
+
+        try:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT id, name, description, latitude, longitude, radius_meters, is_active 
+                FROM location_zones 
+                WHERE is_active = 1 
+                ORDER BY updated_at DESC 
+                LIMIT 1
+            """)
+            result = cursor.fetchone()
+
+            if result:
+                zone = {
+                    'id': result[0],
+                    'name': result[1],
+                    'description': result[2] or '',
+                    'latitude': result[3],
+                    'longitude': result[4],
+                    'radius_meters': result[5],
+                    'is_active': result[6]
+                }
+                logger.debug(f"Active zone found: {zone['name']}")
+                return zone
+            else:
+                logger.warning("No active location zone found")
+                return None
+        except Exception as e:
+            logger.error(f"Error getting active zone: {e}")
+            return None
+
+    def get_all_zones(self) -> pd.DataFrame:
+        """Get all location zones"""
+        conn = self.get_connection()
+        if not conn:
+            return pd.DataFrame()
+
+        try:
+            return pd.read_sql_query("""
+                SELECT id, name, description, latitude, longitude, 
+                       radius_meters, is_active, created_at
+                FROM location_zones
+                ORDER BY is_active DESC, created_at DESC
+            """, conn)
+        except Exception as e:
+            logger.error(f"Error getting zones: {e}")
+            return pd.DataFrame()
+
+    def create_zone(self, name: str, description: str, lat: float, lon: float, 
+                   radius: float, set_active: bool = False) -> bool:
+        """Create a new location zone"""
+        conn = self.get_connection()
+        if not conn:
+            return False
+
+        try:
+            cursor = conn.cursor()
+
+            if set_active:
+                cursor.execute("UPDATE location_zones SET is_active = 0")
+
+            cursor.execute("""
+                INSERT INTO location_zones 
+                (name, description, latitude, longitude, radius_meters, is_active, created_by, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, 'admin', datetime('now'))
+            """, (name, description, lat, lon, radius, 1 if set_active else 0))
+
+            conn.commit()
+            logger.info(f"Zone created: {name}")
+            return True
+        except Exception as e:
+            logger.error(f"Error creating zone: {e}")
+            return False
+
+    def activate_zone(self, zone_id: int) -> bool:
+        """Activate a specific zone"""
+        conn = self.get_connection()
+        if not conn:
+            return False
+
+        try:
+            cursor = conn.cursor()
+            cursor.execute("UPDATE location_zones SET is_active = 0")
+            cursor.execute(
+                "UPDATE location_zones SET is_active = 1, updated_at = datetime('now') WHERE id = ?",
+                (zone_id,)
+            )
+            conn.commit()
+            logger.info(f"Zone {zone_id} activated")
+            return True
+        except Exception as e:
+            logger.error(f"Error activating zone: {e}")
+            return False
+
+    def get_attendance_stats(self, date_str: str = None) -> Dict:
+        """Get attendance statistics"""
+        if date_str is None:
+            date_str = datetime.now().strftime("%Y-%m-%d")
+
+        conn = self.get_connection()
+        if not conn:
+            return {'total': 0, 'present': 0, 'absent': 0, 'rate': 0}
+
+        try:
+            cursor = conn.cursor()
+
+            # Get total registered users
+            cursor.execute("SELECT COUNT(*) FROM users WHERE is_active = 1")
+            total_users = cursor.fetchone()[0]
+
+            # Get present count for the date
+            cursor.execute("""
+                SELECT COUNT(DISTINCT user_id) 
+                FROM attendance 
+                WHERE date = ? AND status = 'Present'
+            """, (date_str,))
+            present = cursor.fetchone()[0]
+
+            absent = total_users - present
+            attendance_rate = (present / total_users * 100) if total_users > 0 else 0
+
+            return {
+                'total': total_users, 
+                'present': present, 
+                'absent': absent, 
+                'rate': attendance_rate
+            }
+        except Exception as e:
+            logger.error(f"Stats calculation error: {e}")
+            return {'total': 0, 'present': 0, 'absent': 0, 'rate': 0}
+
+    def mark_attendance(self, user_id: int, image_data: bytes, location: Dict, 
+                       zone: Dict, distance: float) -> bool:
+        """Mark attendance in database"""
+        conn = self.get_connection()
+        if not conn:
+            return False
+
+        try:
+            cursor = conn.cursor()
+            now = datetime.now()
+            date_str = now.strftime("%Y-%m-%d")
+            time_str = now.strftime("%H:%M:%S")
+
+            cursor.execute("""
+                INSERT INTO attendance 
+                (user_id, date, time, status, image_data, latitude, longitude, 
+                 distance_meters, zone_id, accuracy_meters, device_info, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+            """, (
+                user_id, date_str, time_str, "Present", image_data,
+                location['latitude'], location['longitude'],
+                distance, zone['id'], 
+                location.get('accuracy', 0),
+                f"Browser: {st.context.headers.get('user-agent', 'Unknown')}"
+            ))
+
+            conn.commit()
+            logger.info(f"Attendance marked: user_id={user_id} at {time_str}")
+            return True
+        except Exception as e:
+            logger.error(f"Error marking attendance: {e}")
+            return False
+
+# --- Location Utilities ---
+class LocationManager:
+    """Location and GPS utilities"""
+
+    @staticmethod
+    def is_within_zone(student_loc: Dict, zone: Dict) -> Tuple[bool, Optional[float]]:
+        """Enhanced zone validation with detailed logging"""
+        try:
+            # Input validation
+            if not student_loc or not isinstance(student_loc, dict):
+                logger.warning(f"Invalid student location: {student_loc}")
+                return False, None
+
+            if 'latitude' not in student_loc or 'longitude' not in student_loc:
+                logger.warning(f"Missing coordinates in location: {student_loc}")
+                return False, None
+
+            if not zone:
+                logger.warning("Zone is None")
+                return False, None
+
+            # Extract coordinates
+            student_lat = float(student_loc['latitude'])
+            student_lon = float(student_loc['longitude'])
+            zone_lat = float(zone['latitude'])
+            zone_lon = float(zone['longitude'])
+            zone_radius = float(zone['radius_meters'])
+
+            logger.debug(f"Student: ({student_lat:.6f}, {student_lon:.6f})")
+            logger.debug(f"Zone: ({zone_lat:.6f}, {zone_lon:.6f}), radius: {zone_radius}m")
+
+            # Calculate distance using geopy
+            student_coords = (student_lat, student_lon)
+            zone_coords = (zone_lat, zone_lon)
+
+            distance_meters = geodesic(zone_coords, student_coords).meters
+
+            logger.info(f"Distance from {zone['name']}: {distance_meters:.2f}m (max: {zone_radius}m)")
+
+            is_within = distance_meters <= zone_radius
+
+            return is_within, distance_meters
+
+        except Exception as e:
+            logger.error(f"Location validation error: {e}")
+            return False, None
+
+    @staticmethod
+    def get_location_js() -> str:
+        """Generate JavaScript code for location capture"""
+        return """
+        new Promise(function(resolve, reject) {
+            // Check if geolocation is supported
+            if (!navigator.geolocation) {
+                reject("Geolocation is not supported by this browser");
+                return;
+            }
+
+            console.log("Requesting high-accuracy location...");
+
+            // High accuracy options
+            const options = {
+                enableHighAccuracy: true,
+                timeout: 20000,     // 20 seconds timeout
+                maximumAge: 0       // Don't use cached location
+            };
+
+            // Get current position
+            navigator.geolocation.getCurrentPosition(
+                function(position) {
+                    const result = {
+                        latitude: position.coords.latitude,
+                        longitude: position.coords.longitude,
+                        accuracy: position.coords.accuracy,
+                        altitude: position.coords.altitude,
+                        heading: position.coords.heading,
+                        speed: position.coords.speed,
+                        timestamp: Date.now()
+                    };
+                    console.log("Location obtained:", result);
+                    resolve(result);
+                },
+                function(error) {
+                    let errorMsg = "Unknown location error";
+                    switch(error.code) {
+                        case error.PERMISSION_DENIED:
+                            errorMsg = "Location access denied by user. Please enable location services.";
+                            break;
+                        case error.POSITION_UNAVAILABLE:
+                            errorMsg = "Location information unavailable. Check your GPS/WiFi.";
+                            break;
+                        case error.TIMEOUT:
+                            errorMsg = "Location request timed out. Please try again.";
+                            break;
+                    }
+                    console.error("Geolocation error:", errorMsg);
+                    reject(errorMsg);
+                },
+                options
+            );
+        });
+        """
+
+# --- Image Utilities ---
+class ImageValidator:
+    """Image validation and processing"""
+
+    @staticmethod
+    def validate_image(img_buffer) -> Tuple[bool, str]:
+        """Validate image size and format"""
+        if not img_buffer:
+            return False, "No image provided"
+
+        try:
+            # Check file size
+            img_size_mb = len(img_buffer.getvalue()) / (1024 * 1024)
+            if img_size_mb > Config.MAX_IMAGE_SIZE_MB:
+                return False, f"Image too large ({img_size_mb:.1f}MB). Max: {Config.MAX_IMAGE_SIZE_MB}MB"
+
+            # Validate image format
+            img = Image.open(BytesIO(img_buffer.getvalue()))
+
+            # Check image dimensions
+            width, height = img.size
+            if width < 100 or height < 100:
+                return False, "Image too small. Minimum 100x100 pixels."
+
+            if width > 4000 or height > 4000:
+                return False, "Image too large. Maximum 4000x4000 pixels."
+
+            logger.debug(f"Image validated: {img_size_mb:.2f}MB, {width}x{height}")
+            return True, "Valid"
+
+        except Exception as e:
+            logger.error(f"Image validation error: {e}")
+            return False, f"Invalid image format: {str(e)}"
+
+# --- SMS Notifications (Optional) ---
+class NotificationManager:
+    """SMS and email notifications"""
+
+    def __init__(self):
+        self.twilio_client = None
+        self.setup_twilio()
+
+    def setup_twilio(self):
+        """Setup Twilio client if credentials are available"""
+        if not TWILIO_AVAILABLE:
+            logger.info("Twilio not installed - SMS disabled")
+            return
+
+        account_sid = os.environ.get("TWILIO_ACCOUNT_SID")
+        auth_token = os.environ.get("TWILIO_AUTH_TOKEN")
+        from_number = os.environ.get("TWILIO_FROM_NUMBER")
+
+        if account_sid and auth_token and from_number:
+            try:
+                self.twilio_client = Client(account_sid, auth_token)
+                self.from_number = from_number
+                logger.info("✅ Twilio SMS client initialized")
+            except Exception as e:
+                logger.warning(f"Twilio setup failed: {e}")
+        else:
+            logger.info("📱 Twilio credentials not configured")
+
+    def send_sms(self, to_number: str, message: str) -> bool:
+        """Send SMS notification"""
+        if not self.twilio_client:
+            logger.warning("SMS not available - Twilio not configured")
+            return False
+
+        try:
+            message_obj = self.twilio_client.messages.create(
+                body=message,
+                from_=self.from_number,
+                to=to_number
+            )
+            logger.info(f"SMS sent to {to_number} - SID: {message_obj.sid}")
+            return True
+        except Exception as e:
+            logger.error(f"SMS failed to {to_number}: {e}")
+            return False
+
+# --- Initialize Global Objects ---
+db_manager = DatabaseManager()
+location_manager = LocationManager()
+image_validator = ImageValidator()
+notification_manager = NotificationManager()
+
+# --- Streamlit App Components ---
+
+def render_header():
+    """Render application header"""
+    st.title("🎓 College Webcam Attendance System")
+    st.markdown("### 📍 GPS-Verified Attendance with Real-time Photo Capture")
+
+    # Status indicators
+    col1, col2, col3, col4 = st.columns(4)
+
+    with col1:
+        if db_manager.get_connection():
+            st.success("🟢 Database Connected")
+        else:
+            st.error("🔴 Database Error")
+
+    with col2:
+        active_zone = db_manager.get_active_location_zone()
+        if active_zone:
+            st.success(f"🟢 Zone: {active_zone['name']}")
+        else:
+            st.warning("🟡 No Active Zone")
+
+    with col3:
+        current_time = datetime.now().time()
+        start_time = st.session_state.get('start_time', Config.DEFAULT_START_TIME)
+        end_time = st.session_state.get('end_time', Config.DEFAULT_END_TIME)
+
+        if start_time <= current_time <= end_time:
+            st.success("🟢 Attendance Open")
+        else:
+            st.warning("🟡 Outside Hours")
+
+    with col4:
+        stats = db_manager.get_attendance_stats()
+        st.info(f"📊 Today: {stats['present']}/{stats['total']}")
+
+def render_admin_sidebar():
+    """Render admin control sidebar"""
+    st.sidebar.title("🔐 Admin Panel")
+
+    # Admin authentication
+    admin_pass = st.sidebar.text_input(
+        "Admin Password", 
+        type="password", 
+        key="admin_password"
+    )
+
+    if not admin_pass:
+        st.sidebar.info("Enter admin password to access controls")
         return False
 
-def get_active_location_zone(conn):
-    """Get the currently active location zone for attendance"""
-    cursor = conn.cursor()
-    cursor.execute("""
-        SELECT id, name, latitude, longitude, radius_meters, is_active 
-        FROM location_zones 
-        WHERE is_active = 1 
-        ORDER BY updated_at DESC 
-        LIMIT 1
-    """)
-    result = cursor.fetchone()
-    
-    if result:
-        return {
-            'id': result[0],
-            'name': result[1],
-            'latitude': result[2],
-            'longitude': result[3],
-            'radius_meters': result[4],
-            'is_active': result[5]
-        }
-    return None
-
-def is_within_zone(student_loc, zone):
-    """Check if student location is within the specified zone"""
-    if not student_loc or 'latitude' not in student_loc or 'longitude' not in student_loc:
-        return False, None
-    
-    if not zone:
-        return False, None
-    
-    try:
-        student_coords = (student_loc['latitude'], student_loc['longitude'])
-        zone_coords = (zone['latitude'], zone['longitude'])
-        distance_meters = geodesic(zone_coords, student_coords).meters
-        
-        logger.info(f"Distance from {zone['name']}: {distance_meters:.2f} meters")
-        
-        is_within = distance_meters <= zone['radius_meters']
-        return is_within, distance_meters
-    except Exception as e:
-        logger.error(f"Location validation error: {str(e)}")
-        return False, None
-
-def validate_image(img_buffer):
-    """Validate image size and format"""
-    if not img_buffer:
-        return False, "No image provided"
-    
-    img_size_mb = len(img_buffer.getvalue()) / (1024 * 1024)
-    if img_size_mb > MAX_IMAGE_SIZE_MB:
-        return False, f"Image too large ({img_size_mb:.1f}MB). Max: {MAX_IMAGE_SIZE_MB}MB"
-    
-    try:
-        Image.open(BytesIO(img_buffer.getvalue()))
-        return True, "Valid"
-    except Exception as e:
-        return False, f"Invalid image: {str(e)}"
-
-def sanitize_name(name):
-    """Sanitize and validate student name"""
-    if not name:
-        return None
-    
-    name = ' '.join(name.strip().lower().split())
-    
-    if len(name) < 2 or len(name) > 100:
-        return None
-    
-    if not all(c.isalpha() or c.isspace() or c in "'-." for c in name):
-        return None
-    
-    return name
-
-@st.cache_resource
-def connect_db():
-    """Create database connection"""
-    try:
-        conn = sqlite3.connect("attendance.db", check_same_thread=False)
-        conn.execute("PRAGMA foreign_keys = ON")
-        return conn
-    except Exception as e:
-        logger.error(f"Database connection error: {str(e)}")
-        st.error("❌ Database connection failed")
-        return None
-
-def create_tables(conn):
-    """Initialize database schema with location zones table"""
-    cursor = conn.cursor()
-    
-    # Users table
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT UNIQUE NOT NULL,
-        phone TEXT,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )""")
-    
-    # Location zones table
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS location_zones (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT NOT NULL,
-        latitude REAL NOT NULL,
-        longitude REAL NOT NULL,
-        radius_meters REAL NOT NULL,
-        is_active INTEGER DEFAULT 0,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )""")
-    
-    # Attendance table
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS attendance (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER NOT NULL,
-        date TEXT NOT NULL,
-        time TEXT NOT NULL,
-        status TEXT NOT NULL,
-        image_data BLOB,
-        latitude REAL,
-        longitude REAL,
-        distance_meters REAL,
-        zone_id INTEGER,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
-        FOREIGN KEY(zone_id) REFERENCES location_zones(id)
-    )""")
-    
-    # Create indexes
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_attendance_date ON attendance(date)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_attendance_user_date ON attendance(user_id, date)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_location_zones_active ON location_zones(is_active)")
-    
-    # Parent contacts table
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS parent_contacts (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER NOT NULL,
-        parent_name TEXT,
-        phone TEXT NOT NULL,
-        relationship TEXT,
-        FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
-    )""")
-    
-    # Insert default college location zone if none exists
-    cursor.execute("SELECT COUNT(*) FROM location_zones")
-    if cursor.fetchone()[0] == 0:
-        cursor.execute("""
-            INSERT INTO location_zones (name, latitude, longitude, radius_meters, is_active)
-            VALUES ('College Campus', ?, ?, ?, 1)
-        """, (DEFAULT_COLLEGE_LOCATION[0], DEFAULT_COLLEGE_LOCATION[1], DEFAULT_ALLOWED_RADIUS_KM * 1000))
-    
-    conn.commit()
-    logger.info("Database tables created/verified")
-
-def get_attendance_stats(conn, date_str=None):
-    """Get attendance statistics"""
-    if date_str is None:
-        date_str = datetime.now().strftime("%Y-%m-%d")
-    
-    cursor = conn.cursor()
-    total_users = cursor.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-    present = cursor.execute(
-        "SELECT COUNT(DISTINCT user_id) FROM attendance WHERE date = ? AND status = 'Present'",
-        (date_str,)
-    ).fetchone()[0]
-    
-    absent = total_users - present
-    attendance_rate = (present / total_users * 100) if total_users > 0 else 0
-    
-    return {'total': total_users, 'present': present, 'absent': absent, 'rate': attendance_rate}
-
-# --- Main App ---
-def main():
-    st.title("🎓 College Webcam Attendance System")
-    
-    if "location" not in st.session_state:
-        st.session_state.location = None
-    if "location_verified_at" not in st.session_state:
-        st.session_state.location_verified_at = None
-    
-    conn = connect_db()
-    if not conn:
-        st.error("Cannot proceed without database connection")
-        return
-    
-    create_tables(conn)
-    
-    render_admin_panel(conn)
-    render_student_section(conn)
-    
-    if st.checkbox("📈 Show Dashboard", value=False):
-        render_dashboard(conn)
-
-def render_admin_panel(conn):
-    """Render admin sidebar with location management"""
-    st.sidebar.header("🔐 Admin Panel")
-    
-    admin_pass = st.sidebar.text_input("Enter Admin Password", type="password", key="admin_password")
-    
-    if not admin_pass:
-        st.sidebar.info("Enter password to access admin features")
-        return
-    
-    if not verify_admin_password(admin_pass):
+    if not Security.verify_admin_password(admin_pass):
         st.sidebar.error("❌ Invalid Password")
-        return
-    
+        st.sidebar.info("Default password: admin123")
+        return False
+
     st.sidebar.success("✅ Admin Access Granted")
-    
-    # Location Zone Management
-    st.sidebar.subheader("📍 Location Zone Management")
-    
-    # Show current active zone
-    active_zone = get_active_location_zone(conn)
+
+    # Current system status
+    st.sidebar.markdown("### 📊 System Status")
+
+    active_zone = db_manager.get_active_location_zone()
     if active_zone:
-        st.sidebar.info(
-            f"**Active Zone:** {active_zone['name']}\n\n"
-            f"📍 Lat: {active_zone['latitude']:.6f}\n\n"
-            f"📍 Lon: {active_zone['longitude']:.6f}\n\n"
-            f"📏 Radius: {active_zone['radius_meters']:.0f} meters"
-        )
+        st.sidebar.success(f"✅ Active Zone: {active_zone['name']}")
+        st.sidebar.write(f"📍 Coordinates: {active_zone['latitude']:.4f}, {active_zone['longitude']:.4f}")
+        st.sidebar.write(f"📏 Radius: {active_zone['radius_meters']:.0f}m")
     else:
-        st.sidebar.warning("⚠️ No active location zone set")
-    
-    if st.sidebar.button("🗺️ Manage Location Zones"):
-        st.session_state.show_location_manager = True
-    
-    # Time Window Configuration
-    st.sidebar.subheader("🕒 Attendance Time Window")
-    start_time_default = st.session_state.get('start_time', time(9, 0))
-    end_time_default = st.session_state.get('end_time', time(17, 0))
-    
-    st.session_state.start_time = st.sidebar.time_input("Start Time", value=start_time_default)
-    st.session_state.end_time = st.sidebar.time_input("End Time", value=end_time_default)
-    
-    if st.session_state.start_time >= st.session_state.end_time:
+        st.sidebar.error("❌ No active zone configured")
+        if st.sidebar.button("🏫 Create Default Zone"):
+            success = db_manager.create_zone(
+                name="College Campus",
+                description="Default college campus zone",
+                lat=Config.DEFAULT_COLLEGE_LOCATION[0],
+                lon=Config.DEFAULT_COLLEGE_LOCATION[1],
+                radius=Config.DEFAULT_ALLOWED_RADIUS_KM * 1000,
+                set_active=True
+            )
+            if success:
+                st.sidebar.success("✅ Default zone created")
+                st.rerun()
+            else:
+                st.sidebar.error("❌ Failed to create zone")
+
+    # Quick zone controls
+    st.sidebar.markdown("### 🗺️ Quick Zone Setup")
+
+    col1, col2 = st.sidebar.columns(2)
+    with col1:
+        if st.button("🏫 Campus Wide\n(5.5km)", key="wide_zone"):
+            db_manager.create_zone(
+                "Campus Wide", "Wide campus coverage",
+                Config.DEFAULT_COLLEGE_LOCATION[0], Config.DEFAULT_COLLEGE_LOCATION[1],
+                5500, set_active=True
+            )
+            st.rerun()
+
+    with col2:
+        if st.button("🚪 Classroom\n(50m)", key="precise_zone"):
+            db_manager.create_zone(
+                "Classroom", "Precise classroom attendance",
+                Config.DEFAULT_COLLEGE_LOCATION[0], Config.DEFAULT_COLLEGE_LOCATION[1],
+                50, set_active=True
+            )
+            st.rerun()
+
+    # Time window configuration
+    st.sidebar.markdown("### 🕒 Attendance Hours")
+
+    start_time_key = 'start_time'
+    end_time_key = 'end_time'
+
+    if start_time_key not in st.session_state:
+        st.session_state[start_time_key] = Config.DEFAULT_START_TIME
+    if end_time_key not in st.session_state:
+        st.session_state[end_time_key] = Config.DEFAULT_END_TIME
+
+    st.session_state[start_time_key] = st.sidebar.time_input(
+        "Start Time", 
+        value=st.session_state[start_time_key]
+    )
+    st.session_state[end_time_key] = st.sidebar.time_input(
+        "End Time", 
+        value=st.session_state[end_time_key]
+    )
+
+    if st.session_state[start_time_key] >= st.session_state[end_time_key]:
         st.sidebar.error("⚠️ End time must be after start time")
-    else:
-        st.sidebar.info(
-            f"Window: {st.session_state.start_time.strftime('%H:%M')} – "
-            f"{st.session_state.end_time.strftime('%H:%M')}"
-        )
-    
-    # Statistics
-    st.sidebar.subheader("📊 Today's Stats")
-    stats = get_attendance_stats(conn)
+
+    # Today's statistics
+    st.sidebar.markdown("### 📈 Today's Statistics")
+    stats = db_manager.get_attendance_stats()
+
     st.sidebar.metric("Total Students", stats['total'])
     col1, col2 = st.sidebar.columns(2)
     col1.metric("Present", stats['present'])
     col2.metric("Absent", stats['absent'])
-    st.sidebar.progress(stats['rate'] / 100)
-    st.sidebar.caption(f"Attendance Rate: {stats['rate']:.1f}%")
-    
-    # Admin Actions
-    st.sidebar.subheader("⚙️ Actions")
-    
-    export_format = st.sidebar.selectbox("Export Format", ["CSV", "Excel"])
-    date_range = st.sidebar.date_input(
-        "Select Date Range",
-        value=(datetime.now().date(), datetime.now().date()),
-        max_value=datetime.now().date()
-    )
-    
-    if st.sidebar.button("📥 Export Attendance"):
-        export_attendance_data(conn, date_range, export_format)
-    
-    if st.sidebar.button("🗑️ Delete All Records"):
-        if st.sidebar.checkbox("⚠️ Confirm Deletion", key="delete_confirm"):
-            cursor = conn.cursor()
-            cursor.execute("DELETE FROM attendance")
-            conn.commit()
-            st.sidebar.success("✅ All records deleted")
-            st.rerun()
-    
-    if client:
-        st.sidebar.subheader("📲 SMS Notifications")
-        if st.sidebar.button("Send Daily Summary"):
-            send_daily_summary(conn)
-    
-    # Show location manager modal
-    if st.session_state.get('show_location_manager', False):
-        render_location_manager(conn)
 
-def render_location_manager(conn):
+    if stats['total'] > 0:
+        st.sidebar.progress(stats['rate'] / 100)
+        st.sidebar.caption(f"Attendance Rate: {stats['rate']:.1f}%")
+
+    # Admin actions
+    st.sidebar.markdown("### ⚙️ Admin Actions")
+
+    if st.sidebar.button("🗺️ Manage Zones"):
+        st.session_state.show_zone_manager = True
+
+    if st.sidebar.button("📊 View Dashboard"):
+        st.session_state.show_dashboard = True
+
+    if st.sidebar.button("📥 Export Data"):
+        st.session_state.show_export = True
+
+    return True
+
+def render_zone_manager():
     """Render location zone management interface"""
-    st.markdown("---")
     st.header("🗺️ Location Zone Manager")
-    
-    cursor = conn.cursor()
-    
-    # Tabs for different operations
-    tab1, tab2, tab3 = st.tabs(["📍 Create New Zone", "📋 View All Zones", "🗺️ Interactive Map"])
-    
+
+    tab1, tab2 = st.tabs(["📍 Create Zone", "📋 Manage Zones"])
+
     with tab1:
-        st.subheader("Create New Location Zone")
-        
-        col1, col2 = st.columns(2)
-        
+        st.subheader("Create New Attendance Zone")
+
+        col1, col2 = st.columns([2, 1])
+
         with col1:
-            zone_name = st.text_input(
-                "Zone Name",
-                placeholder="e.g., Classroom 101, Library, Lab A",
-                help="Give a descriptive name for this location"
-            )
-            
-            # Preset locations
-            preset = st.selectbox(
-                "Quick Presets",
-                ["Custom Location", "College Campus (Wide)", "Classroom (Precise)", "Library", "Laboratory"]
-            )
-            
-            if preset == "College Campus (Wide)":
-                default_radius = 5500
-            elif preset == "Classroom (Precise)":
-                default_radius = 10
-            elif preset == "Library":
-                default_radius = 50
-            elif preset == "Laboratory":
-                default_radius = 30
-            else:
-                default_radius = 100
-            
-            radius_meters = st.number_input(
-                "Radius (meters)",
-                min_value=5,
-                max_value=10000,
-                value=default_radius,
-                step=5,
-                help="How far from the center point should attendance be allowed?"
-            )
-        
-        with col2:
-            st.info(
-                "**Recommended Radius Guidelines:**\n\n"
-                "🏫 College Campus: 5000-10000m\n\n"
-                "🚪 Classroom: 10-20m\n\n"
-                "📚 Library: 30-50m\n\n"
-                "🔬 Laboratory: 20-40m\n\n"
-                "🏟️ Sports Complex: 100-200m"
-            )
-        
-        st.markdown("#### Set Location Coordinates")
-        
-        coord_method = st.radio(
-            "Choose coordinate input method:",
-            ["Manual Input", "Click on Map", "Use Current Location"],
-            horizontal=True
-        )
-        
-        if coord_method == "Manual Input":
-            col1, col2 = st.columns(2)
-            with col1:
+            zone_name = st.text_input("Zone Name", placeholder="e.g., Computer Lab A")
+            zone_desc = st.text_area("Description", placeholder="Optional description")
+
+            col1a, col1b = st.columns(2)
+            with col1a:
                 latitude = st.number_input(
-                    "Latitude",
-                    value=DEFAULT_COLLEGE_LOCATION[0],
-                    format="%.6f",
-                    help="Decimal degrees (e.g., 10.678922)"
+                    "Latitude", 
+                    value=Config.DEFAULT_COLLEGE_LOCATION[0],
+                    format="%.6f"
                 )
-            with col2:
+            with col1b:
                 longitude = st.number_input(
-                    "Longitude",
-                    value=DEFAULT_COLLEGE_LOCATION[1],
-                    format="%.6f",
-                    help="Decimal degrees (e.g., 77.032420)"
+                    "Longitude", 
+                    value=Config.DEFAULT_COLLEGE_LOCATION[1],
+                    format="%.6f"
                 )
-        
-        elif coord_method == "Click on Map":
-            st.info("👆 Click on the map in the 'Interactive Map' tab to select coordinates")
-            
-            if 'selected_coords' in st.session_state:
-                latitude = st.session_state.selected_coords[0]
-                longitude = st.session_state.selected_coords[1]
-                st.success(f"Selected: {latitude:.6f}, {longitude:.6f}")
-            else:
-                latitude = DEFAULT_COLLEGE_LOCATION[0]
-                longitude = DEFAULT_COLLEGE_LOCATION[1]
-        
-        else:  # Use Current Location
-            if st.button("📍 Get My Current Location"):
-                js_code = """
-                new Promise(function(resolve, reject) {
-                    if (!navigator.geolocation) {
-                        reject("Geolocation not supported");
-                        return;
-                    }
-                    navigator.geolocation.getCurrentPosition(
-                        function(position) {
-                            resolve({
-                                latitude: position.coords.latitude, 
-                                longitude: position.coords.longitude
-                            });
-                        },
-                        function(error) {
-                            reject("Error: " + error.message);
-                        },
-                        {enableHighAccuracy: true, timeout: 10000}
-                    );
-                });
-                """
-                
-                with st.spinner("Getting your location..."):
+
+            radius = st.slider(
+                "Radius (meters)", 
+                min_value=10, max_value=10000, 
+                value=100, step=10
+            )
+
+            set_active = st.checkbox("Set as active zone", value=True)
+
+        with col2:
+            st.info("**Radius Guidelines:**\n\n🏫 Campus: 5000-10000m\n🚪 Classroom: 10-50m\n📚 Library: 30-100m\n🔬 Lab: 20-50m")
+
+            if st.button("📍 Use My Location"):
+                js_code = location_manager.get_location_js()
+                with st.spinner("Getting location..."):
                     loc_data = streamlit_js_eval(js_expressions=js_code, want_output=True, key=f"admin_loc_{secrets.token_hex(4)}")
-                
-                if isinstance(loc_data, dict) and 'latitude' in loc_data:
-                    latitude = loc_data['latitude']
-                    longitude = loc_data['longitude']
-                    st.success(f"📍 Location captured: {latitude:.6f}, {longitude:.6f}")
-                else:
-                    st.error("Could not get location")
-                    latitude = DEFAULT_COLLEGE_LOCATION[0]
-                    longitude = DEFAULT_COLLEGE_LOCATION[1]
-            else:
-                latitude = DEFAULT_COLLEGE_LOCATION[0]
-                longitude = DEFAULT_COLLEGE_LOCATION[1]
-        
-        # Preview map
-        st.markdown("#### Preview Zone")
-        preview_map = folium.Map(
-            location=[latitude, longitude],
-            zoom_start=17 if radius_meters < 100 else 15
-        )
-        
-        folium.Marker(
-            [latitude, longitude],
-            popup=f"{zone_name or 'New Zone'}<br>Radius: {radius_meters}m",
-            tooltip="Zone Center",
-            icon=folium.Icon(color='red', icon='info-sign')
-        ).add_to(preview_map)
-        
-        folium.Circle(
-            location=[latitude, longitude],
-            radius=radius_meters,
-            color='blue',
-            fill=True,
-            fillColor='blue',
-            fillOpacity=0.2,
-            popup=f"Allowed Area: {radius_meters}m radius"
-        ).add_to(preview_map)
-        
-        folium_static(preview_map, width=700, height=400)
-        
-        # Save button
-        col1, col2 = st.columns([1, 4])
-        with col1:
-            set_active = st.checkbox("Set as Active Zone", value=True)
-        
-        if st.button("💾 Save Location Zone", type="primary", use_container_width=True):
-            if not zone_name:
-                st.error("⚠️ Please enter a zone name")
-            else:
-                try:
-                    # Deactivate all zones if this should be active
-                    if set_active:
-                        cursor.execute("UPDATE location_zones SET is_active = 0")
-                    
-                    # Insert new zone
-                    cursor.execute("""
-                        INSERT INTO location_zones 
-                        (name, latitude, longitude, radius_meters, is_active, updated_at)
-                        VALUES (?, ?, ?, ?, ?, datetime('now'))
-                    """, (zone_name, latitude, longitude, radius_meters, 1 if set_active else 0))
-                    
-                    conn.commit()
-                    st.success(f"✅ Location zone '{zone_name}' created successfully!")
-                    logger.info(f"New zone created: {zone_name} at ({latitude}, {longitude}) with radius {radius_meters}m")
-                    
+                    if isinstance(loc_data, dict) and 'latitude' in loc_data:
+                        st.session_state.temp_lat = loc_data['latitude']
+                        st.session_state.temp_lon = loc_data['longitude']
+                        st.success(f"📍 Location: {loc_data['latitude']:.6f}, {loc_data['longitude']:.6f}")
+
+            if 'temp_lat' in st.session_state:
+                if st.button("✅ Use This Location"):
+                    latitude = st.session_state.temp_lat
+                    longitude = st.session_state.temp_lon
                     st.rerun()
-                except Exception as e:
-                    st.error(f"❌ Error creating zone: {str(e)}")
-    
+
+        # Map preview
+        if latitude and longitude:
+            preview_map = folium.Map(location=[latitude, longitude], zoom_start=16)
+            folium.Marker([latitude, longitude], popup=zone_name or "New Zone").add_to(preview_map)
+            folium.Circle(
+                location=[latitude, longitude],
+                radius=radius,
+                color='blue',
+                fill=True,
+                fillColor='blue',
+                fillOpacity=0.3
+            ).add_to(preview_map)
+            folium_static(preview_map, width=700, height=300)
+
+        if st.button("💾 Create Zone", type="primary"):
+            if not zone_name:
+                st.error("❌ Zone name is required")
+            else:
+                success = db_manager.create_zone(
+                    zone_name, zone_desc or "", latitude, longitude, radius, set_active
+                )
+                if success:
+                    st.success(f"✅ Zone '{zone_name}' created successfully!")
+                    time_module.sleep(1)
+                    st.rerun()
+                else:
+                    st.error("❌ Failed to create zone")
+
     with tab2:
-        st.subheader("All Location Zones")
-        
-        zones_df = pd.read_sql_query("""
-            SELECT 
-                id, name, latitude, longitude, radius_meters, 
-                is_active, created_at
-            FROM location_zones
-            ORDER BY created_at DESC
-        """, conn)
-        
+        st.subheader("Manage Existing Zones")
+
+        zones_df = db_manager.get_all_zones()
+
         if zones_df.empty:
-            st.info("No location zones created yet")
+            st.info("No zones created yet")
         else:
             for _, zone in zones_df.iterrows():
                 with st.expander(
-                    f"{'🟢' if zone['is_active'] else '⚪'} {zone['name']} - "
-                    f"{zone['radius_meters']:.0f}m radius",
+                    f"{'🟢' if zone['is_active'] else '⚪'} {zone['name']} - {zone['radius_meters']:.0f}m",
                     expanded=zone['is_active'] == 1
                 ):
                     col1, col2, col3 = st.columns([2, 2, 1])
-                    
+
                     with col1:
-                        st.write(f"**Zone ID:** {zone['id']}")
-                        st.write(f"**Latitude:** {zone['latitude']:.6f}")
-                        st.write(f"**Longitude:** {zone['longitude']:.6f}")
-                    
-                    with col2:
+                        st.write(f"**Description:** {zone['description'] or 'N/A'}")
+                        st.write(f"**Coordinates:** {zone['latitude']:.6f}, {zone['longitude']:.6f}")
                         st.write(f"**Radius:** {zone['radius_meters']:.0f} meters")
+
+                    with col2:
                         st.write(f"**Status:** {'✅ Active' if zone['is_active'] else '⚪ Inactive'}")
                         st.write(f"**Created:** {zone['created_at'][:16]}")
-                    
+
+                        # Mini map
+                        mini_map = folium.Map(location=[zone['latitude'], zone['longitude']], zoom_start=15)
+                        folium.Circle(
+                            location=[zone['latitude'], zone['longitude']],
+                            radius=zone['radius_meters'],
+                            color='red' if zone['is_active'] else 'gray',
+                            fill=True,
+                            fillOpacity=0.3
+                        ).add_to(mini_map)
+                        folium_static(mini_map, width=250, height=150)
+
                     with col3:
                         if zone['is_active'] == 0:
                             if st.button("Activate", key=f"activate_{zone['id']}"):
-                                cursor.execute("UPDATE location_zones SET is_active = 0")
-                                cursor.execute(
-                                    "UPDATE location_zones SET is_active = 1, updated_at = datetime('now') WHERE id = ?",
-                                    (zone['id'],)
-                                )
-                                conn.commit()
-                                st.success("✅ Zone activated")
-                                st.rerun()
-                        
-                        if st.button("Delete", key=f"delete_{zone['id']}", type="secondary"):
-                            if zone['is_active'] == 1:
-                                st.error("Cannot delete active zone")
-                            else:
-                                cursor.execute("DELETE FROM location_zones WHERE id = ?", (zone['id'],))
-                                conn.commit()
-                                st.success("🗑️ Zone deleted")
-                                st.rerun()
-    
-    with tab3:
-        st.subheader("Interactive Map - All Zones")
-        
-        # Get all zones
-        cursor.execute("SELECT name, latitude, longitude, radius_meters, is_active FROM location_zones")
-        all_zones = cursor.fetchall()
-        
-        if not all_zones:
-            st.info("No zones to display")
-        else:
-            # Create map centered on first zone
-            map_center = [all_zones[0][1], all_zones[0][2]]
-            interactive_map = folium.Map(location=map_center, zoom_start=15)
-            
-            for zone in all_zones:
-                name, lat, lon, radius, is_active = zone
-                color = 'red' if is_active else 'gray'
-                
-                folium.Marker(
-                    [lat, lon],
-                    popup=f"<b>{name}</b><br>Radius: {radius}m<br>{'Active' if is_active else 'Inactive'}",
-                    tooltip=name,
-                    icon=folium.Icon(color=color, icon='info-sign')
-                ).add_to(interactive_map)
-                
-                folium.Circle(
-                    location=[lat, lon],
-                    radius=radius,
-                    color=color,
-                    fill=True,
-                    fillColor=color,
-                    fillOpacity=0.2 if is_active else 0.1,
-                    popup=f"{name}: {radius}m radius"
-                ).add_to(interactive_map)
-            
-            folium_static(interactive_map, width=900, height=600)
-    
-    if st.button("✖️ Close Location Manager"):
-        st.session_state.show_location_manager = False
+                                if db_manager.activate_zone(zone['id']):
+                                    st.success("✅ Zone activated")
+                                    st.rerun()
+
+    if st.button("✖️ Close Zone Manager"):
+        if 'show_zone_manager' in st.session_state:
+            del st.session_state.show_zone_manager
         st.rerun()
 
-def export_attendance_data(conn, date_range, format_type):
-    """Export attendance data"""
-    start_date, end_date = date_range if isinstance(date_range, tuple) else (date_range, date_range)
-    
-    query = """
-        SELECT 
-            u.name AS Name,
-            a.date AS Date,
-            a.time AS Time,
-            a.status AS Status,
-            lz.name AS Location_Zone,
-            a.distance_meters AS Distance_Meters
-        FROM attendance a 
-        JOIN users u ON a.user_id = u.id
-        LEFT JOIN location_zones lz ON a.zone_id = lz.id
-        WHERE a.date BETWEEN ? AND ?
-        ORDER BY a.date DESC, a.time DESC
-    """
-    
-    df = pd.read_sql_query(query, conn, params=(str(start_date), str(end_date)))
-    
-    if df.empty:
-        st.sidebar.warning("No records found")
-        return
-    
-    if format_type == "CSV":
-        csv_data = df.to_csv(index=False).encode('utf-8')
-        st.sidebar.download_button(
-            "💾 Download CSV",
-            data=csv_data,
-            file_name=f"attendance_{start_date}_to_{end_date}.csv",
-            mime="text/csv"
-        )
-    else:
-        buffer = BytesIO()
-        with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
-            df.to_excel(writer, index=False, sheet_name='Attendance')
-        
-        st.sidebar.download_button(
-            "💾 Download Excel",
-            data=buffer.getvalue(),
-            file_name=f"attendance_{start_date}_to_{end_date}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
+def render_student_attendance():
+    """Render student attendance marking section"""
+    st.header("👤 Student Attendance")
 
-def send_daily_summary(conn):
-    """Send daily summary SMS"""
-    today_str = datetime.now().strftime("%Y-%m-%d")
-    
-    all_users_df = pd.read_sql_query("SELECT name FROM users", conn)
-    present_df = pd.read_sql_query(
-        "SELECT u.name FROM attendance a JOIN users u ON a.user_id = u.id "
-        "WHERE a.date = ? AND a.status = 'Present'",
-        conn, params=(today_str,)
-    )
-    
-    all_students = set(all_users_df["name"])
-    present_students = set(present_df["name"])
-    absent_students = sorted(list(all_students - present_students))
-    
-    faculty_number = "+916238533419"
-    summary_msg = (
-        f"Attendance Summary ({today_str}):\n"
-        f"Present: {len(present_students)}\n"
-        f"Absent: {len(absent_students)}\n"
-        f"Absent: {', '.join(absent_students) if absent_students else 'None'}"
-    )
-    
-    if send_sms(faculty_number, summary_msg):
-        st.sidebar.success("✅ SMS sent")
-
-def render_student_section(conn):
-    """Render student attendance section"""
-    st.markdown("---")
-    st.header("👤 Student Attendance Marking")
-    
-    # Get active zone
-    active_zone = get_active_location_zone(conn)
-    
+    # Check prerequisites
+    active_zone = db_manager.get_active_location_zone()
     if not active_zone:
-        st.error("⚠️ No active location zone configured. Please contact admin.")
+        st.error("⚠️ No active attendance zone configured. Please contact admin.")
         return
-    
-    # Display active zone info
-    st.info(
-        f"📍 **Active Attendance Zone:** {active_zone['name']}\n\n"
-        f"You must be within **{active_zone['radius_meters']:.0f} meters** of the designated location to mark attendance."
-    )
-    
+
+    # Display zone information
+    st.info(f"📍 **Active Zone:** {active_zone['name']}\n"
+           f"You must be within **{active_zone['radius_meters']:.0f} meters** of the designated location.")
+
     # Step 1: Location Verification
+    st.markdown("---")
     st.subheader("📍 Step 1: Verify Your Location")
-    
-    col1, col2 = st.columns([2, 1])
-    
-    with col1:
-        st.write(f"Click the button below to verify you're within the **{active_zone['name']}** zone.")
-    
-    with col2:
-        if st.session_state.location:
-            is_valid, distance = is_within_zone(st.session_state.location, active_zone)
+
+    # Location status display
+    location_status_col, refresh_col = st.columns([4, 1])
+
+    with location_status_col:
+        if 'location' in st.session_state and st.session_state.location:
+            is_valid, distance = location_manager.is_within_zone(st.session_state.location, active_zone)
+
             if is_valid:
-                st.success(f"✅ Verified ({distance:.1f}m)")
+                st.success(f"✅ Location Verified! Distance: {distance:.1f}m from {active_zone['name']}")
             else:
-                st.error(f"❌ Too far ({distance:.1f}m)")
-    
-    if st.button("🌍 Get & Verify My Location", use_container_width=True):
-        js_code = """
-        new Promise(function(resolve, reject) {
-            if (!navigator.geolocation) {
-                reject("Geolocation not supported");
-                return;
-            }
-            navigator.geolocation.getCurrentPosition(
-                function(position) {
-                    resolve({
-                        latitude: position.coords.latitude, 
-                        longitude: position.coords.longitude,
-                        accuracy: position.coords.accuracy
-                    });
-                },
-                function(error) {
-                    reject("Error: " + error.message);
-                },
-                {enableHighAccuracy: true, timeout: 10000, maximumAge: 0}
-            );
-        });
-        """
-        
-        with st.spinner("Getting your location..."):
-            location_data = streamlit_js_eval(
-                js_expressions=js_code, 
-                want_output=True, 
-                key=f"student_loc_{secrets.token_hex(4)}"
-            )
-        
-        if isinstance(location_data, dict) and 'latitude' in location_data:
-            st.session_state.location = location_data
-            st.session_state.location_verified_at = datetime.now()
-            
-            is_valid, distance = is_within_zone(location_data, active_zone)
-            
-            st.success(
-                f"📍 Location: {location_data['latitude']:.6f}, "
-                f"{location_data['longitude']:.6f} (±{location_data.get('accuracy', 0):.0f}m)"
-            )
-            
-            if is_valid:
-                st.success(f"✅ You are within the **{active_zone['name']}** zone! Distance: {distance:.1f}m")
-            else:
-                st.error(
-                    f"❌ You are **{distance:.1f} meters** from {active_zone['name']}. "
-                    f"Required: within {active_zone['radius_meters']:.0f}m. "
-                    "Please move closer to the designated location."
-                )
+                st.error(f"❌ Outside Zone! Distance: {distance:.1f}m (max: {active_zone['radius_meters']:.0f}m)")
         else:
-            st.error(
-                "❌ Could not get location. Please ensure:\n"
-                "- Location services are enabled\n"
-                "- You granted permission to this website\n"
-                "- You're using a supported browser"
+            st.info("📍 Click button below to get your current location")
+
+    with refresh_col:
+        if 'location' in st.session_state and st.session_state.location:
+            if st.button("🔄 Refresh"):
+                del st.session_state.location
+                st.rerun()
+
+    # Get location button
+    if st.button("🌍 Get My Location", type="primary", use_container_width=True):
+        with st.spinner("🛰️ Getting your GPS location... Please allow location access."):
+            js_code = location_manager.get_location_js()
+
+            location_data = streamlit_js_eval(
+                js_expressions=js_code,
+                want_output=True,
+                key=f"student_location_{secrets.token_hex(4)}"
             )
-    
+
+            # Wait for result
+            time_module.sleep(1)
+
+            if isinstance(location_data, dict) and 'latitude' in location_data:
+                st.session_state.location = location_data
+                st.session_state.location_timestamp = datetime.now()
+
+                st.success("📍 Location captured successfully!")
+                st.info(f"**Coordinates:** {location_data['latitude']:.6f}, {location_data['longitude']:.6f}")
+                st.info(f"**Accuracy:** ±{location_data.get('accuracy', 0):.0f} meters")
+
+                # Validate immediately
+                is_valid, distance = location_manager.is_within_zone(location_data, active_zone)
+
+                if is_valid:
+                    st.success(f"✅ You are within the attendance zone! ({distance:.1f}m from center)")
+                else:
+                    st.error(f"❌ You are outside the attendance zone! ({distance:.1f}m from center)")
+
+                st.rerun()
+            else:
+                st.error("❌ Could not get your location. Please ensure:")
+                st.markdown("""
+                - Location services are enabled on your device
+                - You granted permission to this website  
+                - You're using a modern browser (Chrome, Firefox, Safari)
+                - You're not in incognito/private browsing mode
+                """)
+
+                if location_data and isinstance(location_data, str):
+                    st.error(f"Error: {location_data}")
+
     # Step 2: Mark Attendance
     st.markdown("---")
-    st.subheader("📸 Step 2: Mark Attendance")
-    
+    st.subheader("📸 Step 2: Take Photo & Mark Attendance")
+
+    # Check if location is valid
+    location_valid = False
+    if 'location' in st.session_state and st.session_state.location:
+        is_valid, distance = location_manager.is_within_zone(st.session_state.location, active_zone)
+        location_valid = is_valid
+
+        # Check location freshness
+        if 'location_timestamp' in st.session_state:
+            elapsed_minutes = (datetime.now() - st.session_state.location_timestamp).seconds / 60
+            if elapsed_minutes > Config.LOCATION_EXPIRE_MINUTES:
+                st.warning(f"⚠️ Location verification expired ({elapsed_minutes:.0f} min ago). Please refresh.")
+                location_valid = False
+
+    if not location_valid:
+        st.info("👆 Complete Step 1 to verify your location before proceeding.")
+
+    # Student name input
     name = st.text_input(
         "Enter your full name",
-        key="student_name",
-        placeholder="e.g., John Doe"
-    ).strip()
-    
-    img_buffer = st.camera_input("📷 Take a picture for verification")
-    
+        placeholder="e.g., John Doe",
+        disabled=not location_valid,
+        help="Enter your complete name as registered"
+    )
+
+    # Camera input for photo
+    img_buffer = st.camera_input(
+        "📷 Take your photo for attendance verification",
+        disabled=not location_valid,
+        help="Look directly at the camera and ensure good lighting"
+    )
+
+    # Display photo preview
     if img_buffer:
-        st.caption("✅ Photo captured")
-    
-    if st.button("✅ Mark My Attendance", type="primary", use_container_width=True):
-        mark_attendance(conn, name, img_buffer, active_zone)
+        st.success("✅ Photo captured successfully")
 
-def mark_attendance(conn, name, img_buffer, active_zone):
-    """Process attendance marking with zone validation"""
-    cursor = conn.cursor()
-    
-    # Validations
-    if not name:
-        st.warning("⚠️ Please enter your name")
-        return
-    
-    sanitized_name = sanitize_name(name)
-    if not sanitized_name:
-        st.error("❌ Invalid name format")
-        return
-    
-    if not img_buffer:
-        st.warning("⚠️ Please take a picture")
-        return
-    
-    is_valid, msg = validate_image(img_buffer)
-    if not is_valid:
-        st.error(f"❌ {msg}")
-        return
-    
-    if "start_time" not in st.session_state or "end_time" not in st.session_state:
-        st.error("⛔ Attendance time window not configured")
-        return
-    
-    if not st.session_state.location:
-        st.warning("⚠️ Please complete Step 1 to verify your location")
-        return
-    
-    # Check location recency
-    if st.session_state.location_verified_at:
-        elapsed_minutes = (datetime.now() - st.session_state.location_verified_at).seconds / 60
-        if elapsed_minutes > 5:
-            st.warning("⚠️ Location verification expired. Please verify again.")
-            st.session_state.location = None
+        # Show small preview
+        with st.expander("👀 Photo Preview"):
+            img = Image.open(img_buffer)
+            st.image(img, width=200, caption="Your attendance photo")
+
+    # Mark attendance button
+    attendance_button_disabled = not (location_valid and name.strip() and img_buffer)
+
+    if st.button(
+        "✅ Mark My Attendance", 
+        type="primary", 
+        use_container_width=True,
+        disabled=attendance_button_disabled
+    ):
+        process_attendance_marking(name, img_buffer, active_zone)
+
+def process_attendance_marking(name: str, img_buffer, active_zone: Dict):
+    """Process the attendance marking"""
+    try:
+        # Validate inputs
+        sanitized_name = Security.sanitize_name(name)
+        if not sanitized_name:
+            st.error("❌ Invalid name format. Please use only letters, spaces, and basic punctuation.")
             return
-    
-    # Validate zone
-    is_within, distance = is_within_zone(st.session_state.location, active_zone)
-    
-    if not is_within:
-        st.error(
-            f"❌ Cannot mark attendance. You are **{distance:.1f} meters** away from {active_zone['name']}. "
-            f"You must be within **{active_zone['radius_meters']:.0f} meters**."
-        )
-        return
-    
-    # Check time window
-    now = datetime.now()
-    current_time = now.time()
-    
-    if not (st.session_state.start_time <= current_time <= st.session_state.end_time):
-        start_str = st.session_state.start_time.strftime('%H:%M')
-        end_str = st.session_state.end_time.strftime('%H:%M')
-        st.warning(f"⏰ Attendance allowed between {start_str} and {end_str}")
-        return
-    
-    # Get or create user
-    cursor.execute("SELECT id FROM users WHERE name=?", (sanitized_name,))
-    result = cursor.fetchone()
-    
-    if not result:
-        cursor.execute("INSERT INTO users (name) VALUES (?)", (sanitized_name,))
-        conn.commit()
-        user_id = cursor.lastrowid
-        logger.info(f"New user: {sanitized_name}")
-    else:
-        user_id = result[0]
-    
-    # Check duplicate
-    date_str = now.strftime("%Y-%m-%d")
-    cursor.execute("SELECT id, time FROM attendance WHERE user_id=? AND date=?", (user_id, date_str))
-    existing = cursor.fetchone()
-    
-    if existing:
-        st.warning(f"⚠️ Attendance already marked for '{sanitized_name.title()}' at {existing[1]}")
-        return
-    
-    # Save attendance
-    time_str = now.strftime("%H:%M:%S")
-    image_bytes = img_buffer.getvalue()
-    
-    cursor.execute(
-        """INSERT INTO attendance 
-        (user_id, date, time, status, image_data, latitude, longitude, distance_meters, zone_id) 
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (
-            user_id, date_str, time_str, "Present", image_bytes,
-            st.session_state.location['latitude'],
-            st.session_state.location['longitude'],
-            distance,
-            active_zone['id']
-        )
-    )
-    conn.commit()
-    
-    st.success(
-        f"✅ Attendance marked for **{sanitized_name.title()}** at {time_str}\n\n"
-        f"📍 Location: {active_zone['name']} ({distance:.1f}m from center)"
-    )
-    logger.info(f"Attendance: {sanitized_name} at {time_str} in {active_zone['name']}")
-    
-    # Clear location
-    st.session_state.location = None
-    st.session_state.location_verified_at = None
 
-def render_dashboard(conn):
-    """Render dashboard"""
-    st.markdown("---")
-    st.header("📋 Attendance Dashboard")
-    
-    selected_date = st.date_input(
-        "Select Date",
-        value=datetime.now().date(),
-        max_value=datetime.now().date()
-    )
-    
+        # Validate image
+        is_valid_img, img_msg = image_validator.validate_image(img_buffer)
+        if not is_valid_img:
+            st.error(f"❌ Image validation failed: {img_msg}")
+            return
+
+        # Check location validity
+        if 'location' not in st.session_state or not st.session_state.location:
+            st.error("❌ Location not verified. Please complete Step 1.")
+            return
+
+        # Validate location freshness
+        if 'location_timestamp' in st.session_state:
+            elapsed_minutes = (datetime.now() - st.session_state.location_timestamp).seconds / 60
+            if elapsed_minutes > Config.LOCATION_EXPIRE_MINUTES:
+                st.error("❌ Location verification expired. Please refresh your location.")
+                return
+
+        # Check zone proximity
+        is_within, distance = location_manager.is_within_zone(st.session_state.location, active_zone)
+        if not is_within:
+            st.error(f"❌ Cannot mark attendance. You are {distance:.1f}m from {active_zone['name']} "
+                    f"(maximum allowed: {active_zone['radius_meters']:.0f}m)")
+            return
+
+        # Check time window
+        current_time = datetime.now().time()
+        start_time = st.session_state.get('start_time', Config.DEFAULT_START_TIME)
+        end_time = st.session_state.get('end_time', Config.DEFAULT_END_TIME)
+
+        if not (start_time <= current_time <= end_time):
+            st.error(f"❌ Attendance can only be marked between {start_time.strftime('%H:%M')} "
+                    f"and {end_time.strftime('%H:%M')}")
+            return
+
+        # Get or create user
+        conn = db_manager.get_connection()
+        if not conn:
+            st.error("❌ Database connection failed")
+            return
+
+        cursor = conn.cursor()
+
+        # Check if user exists
+        cursor.execute("SELECT id FROM users WHERE name=?", (sanitized_name,))
+        result = cursor.fetchone()
+
+        if not result:
+            # Create new user
+            cursor.execute("INSERT INTO users (name) VALUES (?)", (sanitized_name,))
+            conn.commit()
+            user_id = cursor.lastrowid
+            logger.info(f"New user created: {sanitized_name} (ID: {user_id})")
+        else:
+            user_id = result[0]
+
+        # Check for duplicate attendance
+        today = datetime.now().strftime("%Y-%m-%d")
+        cursor.execute("SELECT id, time FROM attendance WHERE user_id=? AND date=?", (user_id, today))
+        existing = cursor.fetchone()
+
+        if existing:
+            st.warning(f"⚠️ Attendance already marked for '{sanitized_name.title()}' today at {existing[1]}")
+            return
+
+        # Mark attendance
+        image_bytes = img_buffer.getvalue()
+        success = db_manager.mark_attendance(
+            user_id, image_bytes, st.session_state.location, active_zone, distance
+        )
+
+        if success:
+            current_time_str = datetime.now().strftime("%H:%M:%S")
+
+            # Success message
+            st.success(f"""
+            🎉 **Attendance Marked Successfully!**
+
+            **Student:** {sanitized_name.title()}  
+            **Time:** {current_time_str}  
+            **Date:** {today}  
+            **Location:** {active_zone['name']}  
+            **Distance:** {distance:.1f}m from center  
+            """)
+
+            # Clear session data
+            if 'location' in st.session_state:
+                del st.session_state.location
+            if 'location_timestamp' in st.session_state:
+                del st.session_state.location_timestamp
+
+            # Celebration effect
+            st.balloons()
+
+            # Auto-refresh after delay
+            time_module.sleep(2)
+            st.rerun()
+        else:
+            st.error("❌ Failed to mark attendance. Please try again.")
+
+    except Exception as e:
+        logger.error(f"Attendance marking error: {e}", exc_info=True)
+        st.error(f"❌ An error occurred: {str(e)}")
+
+def render_dashboard():
+    """Render attendance dashboard"""
+    st.header("📊 Attendance Dashboard")
+
+    # Date selector
+    col1, col2, col3 = st.columns([1, 1, 2])
+
+    with col1:
+        selected_date = st.date_input(
+            "Select Date",
+            value=datetime.now().date(),
+            max_value=datetime.now().date()
+        )
+
+    with col2:
+        # Date range for statistics
+        date_range = st.selectbox(
+            "Statistics Period",
+            ["Today", "This Week", "This Month"],
+            index=0
+        )
+
     date_str = selected_date.strftime("%Y-%m-%d")
-    stats = get_attendance_stats(conn, date_str)
-    
+
+    # Statistics cards
+    stats = db_manager.get_attendance_stats(date_str)
+
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Total Students", stats['total'])
-    col2.metric("Present", stats['present'])
-    col3.metric("Absent", stats['absent'])
-    col4.metric("Rate", f"{stats['rate']:.1f}%")
-    
-    st.subheader(f"📝 Records for {selected_date.strftime('%B %d, %Y')}")
-    
-    df = pd.read_sql_query(
-        """
-        SELECT 
-            u.name, a.time, a.status, a.image_data, 
-            lz.name as zone_name, a.distance_meters
-        FROM attendance a 
-        JOIN users u ON a.user_id = u.id
-        LEFT JOIN location_zones lz ON a.zone_id = lz.id
-        WHERE a.date = ? 
-        ORDER BY a.time ASC
-        """,
-        conn,
-        params=(date_str,)
-    )
-    
-    if df.empty:
-        st.info(f"No records for {selected_date.strftime('%B %d, %Y')}")
-    else:
-        for idx, row in df.iterrows():
-            with st.container():
-                col1, col2, col3, col4, col5 = st.columns([1, 2, 2, 2, 2])
-                
+    col2.metric("Present Today", stats['present'])
+    col3.metric("Absent Today", stats['absent'])
+    col4.metric("Attendance Rate", f"{stats['rate']:.1f}%")
+
+    # Progress bar
+    if stats['total'] > 0:
+        st.progress(stats['rate'] / 100)
+        st.caption(f"Attendance Rate: {stats['rate']:.1f}%")
+
+    # Attendance records
+    st.markdown("---")
+    st.subheader(f"📝 Attendance Records - {selected_date.strftime('%B %d, %Y')}")
+
+    conn = db_manager.get_connection()
+    if conn:
+        try:
+            df = pd.read_sql_query("""
+                SELECT 
+                    u.name as "Student Name",
+                    a.time as "Time",
+                    a.status as "Status",
+                    lz.name as "Location Zone",
+                    ROUND(a.distance_meters, 1) || 'm' as "Distance",
+                    CASE WHEN a.image_data IS NOT NULL THEN '✅' ELSE '❌' END as "Photo",
+                    ROUND(a.accuracy_meters, 0) || 'm' as "GPS Accuracy"
+                FROM attendance a 
+                JOIN users u ON a.user_id = u.id
+                LEFT JOIN location_zones lz ON a.zone_id = lz.id
+                WHERE a.date = ? 
+                ORDER BY a.time DESC
+            """, conn, params=(date_str,))
+
+            if df.empty:
+                st.info(f"📭 No attendance records found for {selected_date.strftime('%B %d, %Y')}")
+            else:
+                st.dataframe(
+                    df, 
+                    use_container_width=True, 
+                    hide_index=True,
+                    column_config={
+                        "Student Name": st.column_config.TextColumn(width="medium"),
+                        "Time": st.column_config.TextColumn(width="small"),
+                        "Status": st.column_config.TextColumn(width="small"),
+                        "Location Zone": st.column_config.TextColumn(width="medium"),
+                        "Distance": st.column_config.TextColumn(width="small"),
+                        "Photo": st.column_config.TextColumn(width="small"),
+                        "GPS Accuracy": st.column_config.TextColumn(width="small")
+                    }
+                )
+
+                # Export options
+                col1, col2 = st.columns(2)
                 with col1:
-                    if row["image_data"]:
-                        try:
-                            img = Image.open(BytesIO(row["image_data"]))
-                            st.image(img, width=80)
-                        except:
-                            st.write("📷")
-                
-                col2.markdown(f"**{row['name'].title()}**")
-                col3.markdown(f"🕐 {row['time']}")
-                col4.markdown(f"📍 {row['zone_name'] or 'N/A'}")
-                
-                if row['distance_meters']:
-                    col5.markdown(f"📏 {row['distance_meters']:.1f}m")
-                else:
-                    col5.markdown("📏 N/A")
-                
-                st.divider()
+                    csv_data = df.to_csv(index=False)
+                    st.download_button(
+                        "📥 Download CSV",
+                        data=csv_data,
+                        file_name=f"attendance_{date_str}.csv",
+                        mime="text/csv"
+                    )
+
+                with col2:
+                    # Show photos option
+                    if st.button("📷 View Photos"):
+                        show_attendance_photos(date_str)
+
+        except Exception as e:
+            st.error(f"❌ Error loading records: {e}")
+            logger.error(f"Dashboard error: {e}")
+
+    if st.button("✖️ Close Dashboard"):
+        if 'show_dashboard' in st.session_state:
+            del st.session_state.show_dashboard
+        st.rerun()
+
+def show_attendance_photos(date_str: str):
+    """Display attendance photos for a specific date"""
+    conn = db_manager.get_connection()
+    if not conn:
+        return
+
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT u.name, a.time, a.image_data
+            FROM attendance a
+            JOIN users u ON a.user_id = u.id
+            WHERE a.date = ? AND a.image_data IS NOT NULL
+            ORDER BY a.time
+        """, (date_str,))
+
+        records = cursor.fetchall()
+
+        if not records:
+            st.info("No photos found for this date")
+            return
+
+        st.subheader(f"📷 Attendance Photos - {date_str}")
+
+        cols = st.columns(3)
+        for i, (name, time, image_data) in enumerate(records):
+            col = cols[i % 3]
+            with col:
+                try:
+                    img = Image.open(BytesIO(image_data))
+                    st.image(img, caption=f"{name.title()}\n{time}", use_column_width=True)
+                except Exception as e:
+                    st.error(f"Error loading image for {name}")
+
+    except Exception as e:
+        st.error(f"Error loading photos: {e}")
+
+# --- Main Application ---
+def main():
+    """Main application function"""
+    try:
+        # Initialize session state
+        if 'show_zone_manager' not in st.session_state:
+            st.session_state.show_zone_manager = False
+        if 'show_dashboard' not in st.session_state:
+            st.session_state.show_dashboard = False
+
+        # Render header
+        render_header()
+
+        # Check database connection
+        if not db_manager.ensure_tables_exist():
+            st.error("❌ Database setup required. Please run: python db.py")
+            st.stop()
+
+        # Render admin sidebar
+        is_admin = render_admin_sidebar()
+
+        # Main content based on admin selections
+        if st.session_state.get('show_zone_manager', False) and is_admin:
+            render_zone_manager()
+        elif st.session_state.get('show_dashboard', False):
+            render_dashboard()
+        else:
+            # Default: Student attendance section
+            render_student_attendance()
+
+        # Footer
+        st.markdown("---")
+        st.markdown("### 💡 Tips for Best Results:")
+        st.markdown("""
+        - **Location**: Ensure GPS/location services are enabled
+        - **Camera**: Use good lighting and look directly at camera  
+        - **Browser**: Use Chrome, Firefox, or Safari for best compatibility
+        - **Connection**: Stable internet connection recommended
+        """)
+
+        # System information
+        with st.expander("ℹ️ System Information"):
+            st.write("**Version:** 3.0")
+            st.write("**Database:** SQLite with WAL mode")
+            st.write("**Location:** GPS + Network positioning")
+            st.write("**Security:** SHA-256 password hashing")
+
+            if is_admin:
+                info = db_manager.db_manager.get_database_info() if hasattr(db_manager, 'db_manager') else {}
+                if info:
+                    st.json(info)
+
+    except Exception as e:
+        logger.error(f"Main app error: {e}", exc_info=True)
+        st.error(f"❌ Application error: {e}")
+        st.info("Please check logs for details")
 
 if __name__ == "__main__":
     main()
