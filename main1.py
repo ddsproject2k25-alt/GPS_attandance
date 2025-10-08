@@ -4,21 +4,27 @@ import pandas as pd
 from datetime import datetime, time
 from io import BytesIO
 from PIL import Image
-import os
+import tempfile
 import zipfile
+import os
 
-# Title
+# 🎓 App Title
 st.title("🎓 College Webcam Attendance System")
+
+# ✅ Use a temporary DB path (works on Streamlit Cloud too)
+if "db_path" not in st.session_state:
+    temp_dir = tempfile.gettempdir()
+    st.session_state.db_path = os.path.join(temp_dir, "attendance.db")
 
 # Persistent DB connection
 if "conn" not in st.session_state:
-    st.session_state.conn = sqlite3.connect("attendance.db", check_same_thread=False)
+    st.session_state.conn = sqlite3.connect(st.session_state.db_path, check_same_thread=False)
     st.session_state.cursor = st.session_state.conn.cursor()
 
-cursor = st.session_state.cursor
 conn = st.session_state.conn
+cursor = st.session_state.cursor
 
-# Create tables if not exist
+# ✅ Create tables if not exist
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -38,34 +44,35 @@ CREATE TABLE IF NOT EXISTS attendance (
 """)
 conn.commit()
 
-# Admin login
+# 🔐 Admin login
 st.sidebar.subheader("🔐 Admin Panel")
 admin_pass = st.sidebar.text_input("Enter admin password", type="password")
 admin_logged_in = admin_pass == "admin123"
 
-# Admin-only controls
+# ✅ Admin-only controls
 if admin_logged_in:
-    st.sidebar.success("Admin access granted")
+    st.sidebar.success("✅ Admin access granted")
 
-    # Time sliders
+    # Time window setup
     new_start_hour = st.sidebar.slider("Start Hour", 0, 23, 9)
     new_start_minute = st.sidebar.slider("Start Minute", 0, 59, 0)
     new_end_hour = st.sidebar.slider("End Hour", 0, 23, 9)
     new_end_minute = st.sidebar.slider("End Minute", 0, 59, 15)
 
-    # Set Time button
     if st.sidebar.button("🕘 Set Time Window"):
         st.session_state.start_time = time(new_start_hour, new_start_minute)
         st.session_state.end_time = time(new_end_hour, new_end_minute)
-        st.sidebar.success(f"✅ Time window updated to {new_start_hour:02d}:{new_start_minute:02d} – {new_end_hour:02d}:{new_end_minute:02d}")
+        st.sidebar.success(
+            f"✅ Time window set: {new_start_hour:02d}:{new_start_minute:02d} – {new_end_hour:02d}:{new_end_minute:02d}"
+        )
 
-    # Delete attendance records button
+    # Delete attendance data
     if st.sidebar.button("🗑️ Delete All Attendance Records"):
         cursor.execute("DELETE FROM attendance")
         conn.commit()
         st.sidebar.warning("⚠️ All attendance records deleted.")
 
-    # Download attendance archive (CSV + images)
+    # 📦 Download attendance archive (CSV + images in-memory)
     df = pd.read_sql_query("""
         SELECT a.id, u.name, a.date, a.time, a.status, a.image_data
         FROM attendance a
@@ -73,40 +80,44 @@ if admin_logged_in:
         ORDER BY a.id DESC
     """, conn)
 
-    if st.sidebar.button("📦 Download Attendance Archive"):
-        os.makedirs("attendance_images", exist_ok=True)
-        csv_path = "attendance_images/attendance.csv"
-        df.drop(columns=["image_data"]).to_csv(csv_path, index=False)
+    if st.sidebar.button("📦 Prepare Attendance Archive"):
+        zip_buffer = BytesIO()
 
-        # Save images
-        for i, row in df.iterrows():
-            if row["image_data"]:
-                img_path = f"attendance_images/{row['name']}_{row['time'].replace(':', '-')}.jpg"
-                with open(img_path, "wb") as f:
-                    f.write(row["image_data"])
+        with zipfile.ZipFile(zip_buffer, "w") as zipf:
+            # Add CSV to ZIP
+            csv_data = df.drop(columns=["image_data"]).to_csv(index=False)
+            zipf.writestr("attendance.csv", csv_data)
 
-        # Create ZIP
-        zip_path = "attendance_archive.zip"
-        with zipfile.ZipFile(zip_path, "w") as zipf:
-            zipf.write(csv_path)
-            for file in os.listdir("attendance_images"):
-                zipf.write(os.path.join("attendance_images", file))
+            # Add images
+            for i, row in df.iterrows():
+                if row["image_data"]:
+                    img_name = f"{row['name']}_{row['time'].replace(':', '-')}.jpg"
+                    zipf.writestr(img_name, row["image_data"])
 
-        with open(zip_path, "rb") as f:
-            st.sidebar.download_button("📥 Download Archive", f.read(), file_name="attendance_archive.zip", mime="application/zip")
+        zip_buffer.seek(0)
+        st.sidebar.download_button(
+            "📥 Download Archive",
+            zip_buffer,
+            file_name="attendance_archive.zip",
+            mime="application/zip",
+        )
 
 else:
-    st.sidebar.info("Admin access required to set attendance time window.")
+    st.sidebar.info("ℹ️ Admin access required to set attendance window.")
 
-# Webcam input
+# 📷 Webcam input
 img = st.camera_input("📷 Take a picture")
 
-# Name input
-name = st.text_input("🧑 Enter your name")
+# 🧑 Name input
+name = st.text_input("🧍 Enter your name")
 
-# Attendance marking
-if st.button("✅ Mark Attendance", key="mark_btn"):
-    if name.strip() and img:
+# ✅ Mark Attendance Button
+if st.button("✅ Mark Attendance"):
+    if not name.strip():
+        st.warning("⚠️ Please enter your name.")
+    elif not img:
+        st.warning("⚠️ Please capture your photo.")
+    else:
         if "start_time" not in st.session_state or "end_time" not in st.session_state:
             st.warning("⛔ Attendance time window not set. Please contact admin.")
         else:
@@ -116,6 +127,7 @@ if st.button("✅ Mark Attendance", key="mark_btn"):
             end_time = st.session_state.end_time
 
             if start_time <= current_time <= end_time:
+                # Check if user exists
                 cursor.execute("SELECT id FROM users WHERE name=?", (name,))
                 result = cursor.fetchone()
 
@@ -126,12 +138,12 @@ if st.button("✅ Mark Attendance", key="mark_btn"):
                     result = cursor.fetchone()
 
                 user_id = result[0]
-                date, time_str = now.strftime("%Y-%m-%d"), now.strftime("%H:%M:%S")
+                date = now.strftime("%Y-%m-%d")
+                time_str = now.strftime("%H:%M:%S")
                 image_bytes = img.getvalue()
 
-                cursor.execute("""
-                    SELECT * FROM attendance WHERE user_id=? AND date=?
-                """, (user_id, date))
+                # Check if already marked today
+                cursor.execute("SELECT * FROM attendance WHERE user_id=? AND date=?", (user_id, date))
                 if cursor.fetchone():
                     st.warning(f"⚠️ Attendance already marked today for {name}")
                 else:
@@ -142,11 +154,11 @@ if st.button("✅ Mark Attendance", key="mark_btn"):
                     conn.commit()
                     st.success(f"✅ Attendance marked for {name} at {time_str}")
             else:
-                st.warning(f"⏰ Attendance can only be marked between {start_time.strftime('%H:%M')} and {end_time.strftime('%H:%M')}")
-    else:
-        st.warning("⚠️ Please enter your name and capture a photo.")
+                st.warning(
+                    f"⏰ Attendance allowed between {start_time.strftime('%H:%M')} – {end_time.strftime('%H:%M')}"
+                )
 
-# Attendance viewer
+# 📊 Attendance Viewer
 if st.checkbox("📊 Show Attendance Records"):
     df = pd.read_sql_query("""
         SELECT a.id, u.name, a.date, a.time, a.status, a.image_data
@@ -165,14 +177,14 @@ if st.checkbox("📊 Show Attendance Records"):
     col4.markdown("**⏰ Time**")
     col5.markdown("**✅ Status**")
 
-    # Table rows
+    # Rows
     for _, row in df.iterrows():
-        col1, col2, col3, col4, col5 = st.columns([1.5, 2, 2, 2, 2])
-        if row['image_data']:
-            col1.image(BytesIO(row['image_data']), width=80)
+        c1, c2, c3, c4, c5 = st.columns([1.5, 2, 2, 2, 2])
+        if row["image_data"]:
+            c1.image(BytesIO(row["image_data"]), width=80)
         else:
-            col1.write("No image")
-        col2.write(row['name'])
-        col3.write(row['date'])
-        col4.write(row['time'])
-        col5.write(row['status'])
+            c1.write("No image")
+        c2.write(row["name"])
+        c3.write(row["date"])
+        c4.write(row["time"])
+        c5.write(row["status"])
