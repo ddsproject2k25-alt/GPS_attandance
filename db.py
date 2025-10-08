@@ -2,13 +2,15 @@
 """
 Database Setup and Management for College Attendance System
 Created: October 2025
-Version: 2.0 (Fixed Schema)
+Version: 3.0 (Fixed Zone Management)
+Author: CS/IT Student
 """
 
 import sqlite3
 import logging
 import os
 from datetime import datetime
+import hashlib
 
 # Configure logging
 logging.basicConfig(
@@ -29,19 +31,22 @@ DEFAULT_COLLEGE_LOCATION = {
     'radius_meters': 5500
 }
 
+
 class AttendanceDatabase:
-    """Database manager for attendance system"""
+    """Database manager for attendance system with fixed zone management"""
 
     def __init__(self, db_path="attendance.db"):
         self.db_path = db_path
         self.conn = None
 
     def connect(self):
-        """Establish database connection"""
+        """Establish database connection with optimized settings"""
         try:
             self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
             self.conn.execute("PRAGMA foreign_keys = ON")
             self.conn.execute("PRAGMA journal_mode = WAL")  # Better concurrency
+            self.conn.execute("PRAGMA busy_timeout = 5000")  # 5 second timeout
+            self.conn.execute("PRAGMA synchronous = NORMAL")  # Better performance
             logger.info(f"✅ Connected to database: {self.db_path}")
             return self.conn
         except Exception as e:
@@ -63,7 +68,7 @@ class AttendanceDatabase:
                 name TEXT UNIQUE NOT NULL,
                 email TEXT UNIQUE,
                 phone TEXT,
-                roll_number TEXT UNIQUE,
+                roll_number TEXT UNIQUE NOT NULL,
                 department TEXT,
                 year_of_study INTEGER,
                 is_active INTEGER DEFAULT 1,
@@ -71,11 +76,11 @@ class AttendanceDatabase:
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )""")
 
-            # 2. Location Zones Table
+            # 2. Location Zones Table (Fixed with better constraints)
             cursor.execute("""
             CREATE TABLE IF NOT EXISTS location_zones (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL,
+                name TEXT NOT NULL UNIQUE,
                 description TEXT,
                 latitude REAL NOT NULL,
                 longitude REAL NOT NULL,
@@ -333,7 +338,7 @@ class AttendanceDatabase:
         zone_count = cursor.fetchone()[0]
 
         if zone_count == 0:
-            # Insert default college location
+            # Insert default college location (ACTIVE by default)
             cursor.execute("""
                 INSERT INTO location_zones 
                 (name, description, latitude, longitude, radius_meters, is_active, created_by)
@@ -346,7 +351,7 @@ class AttendanceDatabase:
                 DEFAULT_COLLEGE_LOCATION['radius_meters']
             ))
 
-            # Insert additional sample zones
+            # Insert additional sample zones (INACTIVE by default)
             sample_zones = [
                 ('Library', 'College library building', 10.678500, 77.032100, 50),
                 ('Computer Lab', 'Main computer laboratory', 10.678800, 77.032300, 30),
@@ -369,7 +374,6 @@ class AttendanceDatabase:
 
         if admin_count == 0:
             # Insert default admin (password: admin123)
-            import hashlib
             default_password_hash = hashlib.sha256("admin123".encode()).hexdigest()
 
             cursor.execute("""
@@ -385,6 +389,153 @@ class AttendanceDatabase:
             ))
 
             logger.info("✅ Default admin user created (username: admin, password: admin123)")
+
+    def activate_zone(self, zone_id: int) -> bool:
+        """
+        Activate a specific zone - FIXED VERSION
+        Deactivates all other zones before activating the selected one
+        """
+        try:
+            cursor = self.conn.cursor()
+
+            # First, deactivate all zones
+            cursor.execute("""
+                UPDATE location_zones 
+                SET is_active = 0, updated_at = CURRENT_TIMESTAMP
+            """)
+
+            # Then activate the selected zone
+            cursor.execute("""
+                UPDATE location_zones 
+                SET is_active = 1, updated_at = CURRENT_TIMESTAMP 
+                WHERE id = ?
+            """, (zone_id,))
+
+            self.conn.commit()
+
+            if cursor.rowcount > 0:
+                logger.info(f"✅ Zone {zone_id} activated successfully")
+                return True
+            else:
+                logger.warning(f"⚠️ Zone {zone_id} not found")
+                return False
+
+        except Exception as e:
+            logger.error(f"❌ Zone activation failed: {e}")
+            self.conn.rollback()
+            return False
+
+    def create_zone(self, name: str, description: str, latitude: float, 
+                   longitude: float, radius_meters: float, created_by: str = 'System') -> bool:
+        """
+        Create a new zone - FIXED VERSION
+        Optionally deactivates all other zones and activates this one
+        """
+        try:
+            cursor = self.conn.cursor()
+
+            # Deactivate all existing zones first
+            cursor.execute("UPDATE location_zones SET is_active = 0")
+
+            # Insert new zone as active
+            cursor.execute("""
+                INSERT INTO location_zones 
+                (name, description, latitude, longitude, radius_meters, is_active, created_by)
+                VALUES (?, ?, ?, ?, ?, 1, ?)
+            """, (name, description, latitude, longitude, radius_meters, created_by))
+
+            self.conn.commit()
+            logger.info(f"✅ Zone '{name}' created and activated")
+            return True
+
+        except sqlite3.IntegrityError as e:
+            logger.error(f"❌ Zone creation failed - duplicate name: {e}")
+            self.conn.rollback()
+            return False
+        except Exception as e:
+            logger.error(f"❌ Zone creation failed: {e}")
+            self.conn.rollback()
+            return False
+
+    def get_active_zone(self):
+        """Get the currently active zone"""
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute("""
+                SELECT id, name, description, latitude, longitude, radius_meters, created_by, created_at
+                FROM location_zones 
+                WHERE is_active = 1 
+                LIMIT 1
+            """)
+            row = cursor.fetchone()
+            if row:
+                return {
+                    'id': row[0],
+                    'name': row[1],
+                    'description': row[2],
+                    'latitude': row[3],
+                    'longitude': row[4],
+                    'radius_meters': row[5],
+                    'created_by': row[6],
+                    'created_at': row[7]
+                }
+            return None
+        except Exception as e:
+            logger.error(f"❌ Failed to get active zone: {e}")
+            return None
+
+    def get_all_zones(self):
+        """Get all zones"""
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute("""
+                SELECT id, name, description, latitude, longitude, 
+                       radius_meters, is_active, created_by, created_at
+                FROM location_zones 
+                ORDER BY is_active DESC, created_at DESC
+            """)
+            rows = cursor.fetchall()
+            zones = []
+            for row in rows:
+                zones.append({
+                    'id': row[0],
+                    'name': row[1],
+                    'description': row[2],
+                    'latitude': row[3],
+                    'longitude': row[4],
+                    'radius_meters': row[5],
+                    'is_active': row[6],
+                    'created_by': row[7],
+                    'created_at': row[8]
+                })
+            return zones
+        except Exception as e:
+            logger.error(f"❌ Failed to get zones: {e}")
+            return []
+
+    def delete_zone(self, zone_id: int) -> bool:
+        """Delete a zone (only if not active)"""
+        try:
+            cursor = self.conn.cursor()
+
+            # Check if zone is active
+            cursor.execute("SELECT is_active FROM location_zones WHERE id = ?", (zone_id,))
+            row = cursor.fetchone()
+
+            if row and row[0] == 1:
+                logger.warning(f"⚠️ Cannot delete active zone {zone_id}")
+                return False
+
+            cursor.execute("DELETE FROM location_zones WHERE id = ?", (zone_id,))
+            self.conn.commit()
+
+            logger.info(f"✅ Zone {zone_id} deleted")
+            return True
+
+        except Exception as e:
+            logger.error(f"❌ Zone deletion failed: {e}")
+            self.conn.rollback()
+            return False
 
     def backup_database(self, backup_path=None):
         """Create database backup"""
@@ -458,6 +609,14 @@ def create_tables():
         for key, value in info.items():
             print(f"{key}: {value}")
 
+        # Display active zone
+        active_zone = db.get_active_zone()
+        if active_zone:
+            print("\n📍 Active Zone:")
+            print(f"Name: {active_zone['name']}")
+            print(f"Radius: {active_zone['radius_meters']}m")
+            print(f"Coordinates: ({active_zone['latitude']}, {active_zone['longitude']})")
+
         return True
     except Exception as e:
         logger.error(f"❌ Database setup failed: {e}")
@@ -489,13 +648,77 @@ def reset_database():
     return create_tables()
 
 
+def test_zone_management():
+    """Test zone management functions"""
+    print("\n🧪 Testing Zone Management...")
+    print("=" * 50)
+
+    db = AttendanceDatabase()
+    try:
+        db.connect()
+        db.create_tables()
+
+        # Test 1: Get active zone
+        print("\n1. Getting active zone...")
+        active = db.get_active_zone()
+        if active:
+            print(f"✅ Active zone: {active['name']}")
+        else:
+            print("❌ No active zone found")
+
+        # Test 2: Create new zone
+        print("\n2. Creating new test zone...")
+        success = db.create_zone(
+            "Test Zone",
+            "Testing zone creation",
+            10.680000,
+            77.030000,
+            100,
+            "TestUser"
+        )
+        print(f"{'✅' if success else '❌'} Zone creation: {success}")
+
+        # Test 3: Get all zones
+        print("\n3. Getting all zones...")
+        zones = db.get_all_zones()
+        print(f"Total zones: {len(zones)}")
+        for zone in zones:
+            status = "🟢 ACTIVE" if zone['is_active'] else "⚪ Inactive"
+            print(f"  {status} {zone['name']} ({zone['radius_meters']}m)")
+
+        # Test 4: Switch active zone
+        if len(zones) > 1:
+            print("\n4. Switching active zone...")
+            # Activate the first inactive zone
+            for zone in zones:
+                if not zone['is_active']:
+                    success = db.activate_zone(zone['id'])
+                    print(f"{'✅' if success else '❌'} Activated zone: {zone['name']}")
+                    break
+
+        # Test 5: Verify only one active zone
+        print("\n5. Verifying single active zone...")
+        cursor = db.conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM location_zones WHERE is_active = 1")
+        active_count = cursor.fetchone()[0]
+        print(f"{'✅' if active_count == 1 else '❌'} Active zones count: {active_count}")
+
+        print("\n✅ All tests completed!")
+
+    except Exception as e:
+        print(f"❌ Test failed: {e}")
+    finally:
+        db.close()
+
+
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description='College Attendance Database Manager')
+    parser = argparse.ArgumentParser(description='College Attendance Database Manager v3.0')
     parser.add_argument('--reset', action='store_true', help='Reset database (WARNING: Deletes all data)')
     parser.add_argument('--backup', action='store_true', help='Create database backup')
     parser.add_argument('--info', action='store_true', help='Show database information')
+    parser.add_argument('--test', action='store_true', help='Test zone management functionality')
 
     args = parser.parse_args()
 
@@ -524,22 +747,49 @@ if __name__ == "__main__":
         db = AttendanceDatabase()
         try:
             db.connect()
+            db.create_tables()
             info = db.get_database_info()
             print("\n📊 Database Information:")
             print("=" * 50)
             for key, value in info.items():
                 print(f"{key}: {value}")
+
+            # Show active zone details
+            active_zone = db.get_active_zone()
+            if active_zone:
+                print("\n📍 Active Zone Details:")
+                print("=" * 50)
+                for key, value in active_zone.items():
+                    print(f"{key}: {value}")
+
+            # Show all zones
+            print("\n📍 All Zones:")
+            print("=" * 50)
+            zones = db.get_all_zones()
+            for zone in zones:
+                status = "🟢 ACTIVE" if zone['is_active'] else "⚪ Inactive"
+                print(f"{status} {zone['name']} - {zone['description']}")
+                print(f"   Radius: {zone['radius_meters']}m | Created by: {zone['created_by']}")
+
         except Exception as e:
             print(f"❌ Info retrieval failed: {e}")
         finally:
             db.close()
 
+    elif args.test:
+        test_zone_management()
+
     else:
         if create_tables():
-            print("✅ Database setup completed successfully!")
+            print("\n✅ Database setup completed successfully!")
             print("\n🔑 Default Admin Credentials:")
             print("Username: admin")
             print("Password: admin123")
             print("\n💡 Run 'python db.py --help' for more options")
+            print("\n📚 Available commands:")
+            print("  python db.py --info      # Show database information")
+            print("  python db.py --backup    # Create backup")
+            print("  python db.py --reset     # Reset database")
+            print("  python db.py --test      # Test zone management")
         else:
             print("❌ Database setup failed!")
